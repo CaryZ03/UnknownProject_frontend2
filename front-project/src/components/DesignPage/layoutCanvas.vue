@@ -1,0 +1,1448 @@
+<template>
+  <div
+    class="innerboard"
+    @mouseup="ProduceElement"
+    @mousemove="dragCanvas"
+    @mousedown="startDrag"
+    id="board"
+  >
+    <!-- <input type="file" id="ModelLoader" accept="image/*" multiple="multiple" />
+    <input type="file" id="CoverLoader" accept="image/*" multiple="multiple" />
+    <n-button @click="saveModel"></n-button> -->
+    <div class="innercanvas" id="canvas">
+      <layout-element
+        v-for="(params, index) in layoutElementParams"
+        :key="index"
+        :elementParams="params"
+        :update="true"
+        :index="index"
+        :data-index="index"
+        @updateSelects="updateSelects"
+        @changeUpdate="changeUpdate"
+        @dblclick="editContent(index)"
+        ref="layoutElements"
+        name="elements"
+      >
+      </layout-element>
+    </div>
+    <div id="blank" class="blank"></div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, reactive, onMounted, watch } from "vue";
+import layoutElement from "./layoutElement.vue";
+import html2canvas from "html2canvas";
+import saveAs from "file-saver";
+import axios from "axios";
+import utils from "@/Utils";
+import { useMessage } from "naive-ui";
+
+import Selecto from "selecto";
+import Moveable from "moveable";
+
+let ws: WebSocket = null;
+
+const headers = {
+  Authorization: utils.getCookie("Authorization"),
+};
+
+const message = useMessage();
+
+const selected = ref<any[]>([]);
+const selectedId = ref<number[]>([]);
+let selectEns = false;
+let preparedType: string = "";
+let dragging: boolean = false;
+let spacing: boolean = false;
+let dragFromX: number = 0;
+let dragFromY: number = 0;
+let transDragFromX: number = 0;
+let transDragFromY: number = 0;
+let version: number = 0;
+let update = ref<boolean>(true);
+let locked: boolean = false;
+let layoutId: number = 0;
+
+const canvasTrans = {
+  x: 0,
+  y: 0,
+  width: 0,
+  height: 0,
+};
+
+type elementParams = {
+  id: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scaleX: number;
+  scaleY: number;
+  rotation: number;
+  borderWidth: number;
+  borderRadius: string;
+  type: string;
+  color: string;
+  borderColor: string;
+  src: string;
+  text: string;
+  fontSize: number;
+};
+
+type ComServer = {
+  id: number;
+  content: string;
+};
+
+type Prop = {
+  layoutId: number;
+  tool: string;
+  update: boolean;
+  elementProps: elementParams;
+  canvasWidth: number;
+  canvasHeight: number;
+  modelElements: elementParams[];
+};
+
+const props = defineProps<Prop>();
+
+const emits = defineEmits(["updateProps", "changeUpdate", "initPageImgs"]);
+
+const layoutElementParams: (elementParams | null)[] = reactive([]);
+const paramsDic: { [key: number]: elementParams } = {};
+const layoutElements = ref<any>([]);
+let updates: elementParams[] = [];
+
+let moveable: Moveable;
+
+const initMoveable = () => {
+  moveable = new Moveable(document.getElementById("canvas"), {
+    target: [].slice.call(document.getElementsByName("elements")),
+    // If the container is null, the position is fixed. (default: parentElement(document.body))
+    container: document.getElementById("canvas"),
+    elementGuidelines: [].slice.call(document.getElementsByName("elements")),
+    renderDirections: ["n", "nw", "ne", "s", "se", "sw", "e", "w"],
+    snapDirections: {
+      left: true,
+      top: true,
+      right: true,
+      bottom: true,
+      center: true,
+      middle: true,
+    },
+    elementSnapDirections: {
+      left: true,
+      top: true,
+      right: true,
+      bottom: true,
+      center: true,
+      middle: true,
+    },
+    verticalGuidelines: [0],
+    horizontalGuidelines: [0],
+    defaultGroupOrigin: "50% 50%",
+    defaultGroupRotate: 0,
+    draggable: true,
+    resizable: true,
+    scalable: false,
+    rotatable: true,
+    warpable: false,
+    snappable: true,
+    roundable: false,
+    roundRelative: false,
+    snapGap: true,
+    snapThreshold: 5,
+    origin: true,
+    originDraggable: true,
+    keepRatio: false,
+    // Resize, mscale Events at edges.
+    edge: true,
+    throttleDrag: 0,
+    throttleResize: 0,
+    throttleScale: 0,
+    throttleRotate: 0,
+  });
+  /* draggable */
+  moveable
+    .on("clickGroup", (e) => {
+      selecto.clickTarget(e.inputEvent, e.inputTarget);
+    })
+    .on("dragStart", () => {
+      updateProps();
+      update.value = false;
+    })
+    .on("dragGroupStart", () => {
+      updateProps();
+      update.value = false;
+    })
+    .on("drag", ({ target, translate, transform }) => {
+      layoutElementParams[selectedId.value[0]].x = translate[0] / mscale;
+      layoutElementParams[selectedId.value[0]].y = translate[1] / mscale;
+      updateTransform(
+        selected.value[0],
+        layoutElementParams[selectedId.value[0]]
+      );
+      updateProps();
+    })
+    .on("dragGroup", ({ targets, events }) => {
+      if (!locked) {
+        var i = 0;
+        for (i = 0; i < targets.length; ++i) {
+          layoutElementParams[selectedId.value[i]].x =
+            events[i].translate[0] / mscale;
+          layoutElementParams[selectedId.value[i]].y =
+            events[i].translate[1] / mscale;
+          updateTransform(
+            selected.value[i],
+            layoutElementParams[selectedId.value[i]]
+          );
+        }
+      }
+    })
+    .on("dragGroupEnd", () => {
+      changeUpdate();
+      updateUpdates();
+      wsUpdate();
+      update.value = true;
+    })
+    .on("dragEnd", () => {
+      changeUpdate();
+      updateUpdates();
+      wsUpdate();
+      update.value = true;
+    });
+
+  /* resizable */
+  moveable
+    .on("resizeStart", (e) => {
+      e.setOrigin(["%", "%"]);
+      e.dragStart && e.dragStart.set([0, 0]);
+      updateProps();
+      update.value = false;
+    })
+    .on("resize", ({ target, delta, width, height, transform, drag }) => {
+      //target!.style.width = `${width}px`;
+      //target!.style.height = `${height}px`;
+      //target.style.transform = transform; //`translate(${drag.beforeTranslate[0]}px, ${drag.beforeTranslate[1]}px)`;
+      layoutElementParams[selectedId.value[0]].width = width / mscale;
+      layoutElementParams[selectedId.value[0]].height = height / mscale;
+      layoutElementParams[selectedId.value[0]].x = drag.translate[0] / mscale;
+      layoutElementParams[selectedId.value[0]].y = drag.translate[1] / mscale;
+      updateTransform(
+        selected.value[0],
+        layoutElementParams[selectedId.value[0]]
+      );
+      updateProps();
+    })
+    .on("resizeEnd", () => {
+      changeUpdate();
+      updateUpdates();
+      wsUpdate();
+      update.value = true;
+    })
+    .on("resizeGroupStart", ({ events }) => {
+      events.forEach((ev, i) => {
+        ev.dragStart &&
+          ev.dragStart.set([
+            layoutElementParams[selectedId.value[i]].x,
+            layoutElementParams[selectedId.value[i]].y,
+          ]);
+      });
+      update.value = false;
+    })
+    .on("resizeGroup", ({ events }) => {
+      events.forEach((ev, i) => {
+        layoutElementParams[selectedId.value[i]].x =
+          ev.drag.translate[0] / mscale;
+        layoutElementParams[selectedId.value[i]].y =
+          ev.drag.translate[1] / mscale;
+        layoutElementParams[selectedId.value[i]].width = ev.width / mscale;
+        layoutElementParams[selectedId.value[i]].height = ev.height / mscale;
+        updateTransform(
+          selected.value[i],
+          layoutElementParams[selectedId.value[i]]
+        );
+      });
+    })
+    .on("resizeGroupEnd", () => {
+      updateUpdates();
+      wsUpdate();
+    });
+
+  /* scalable */
+  moveable
+    .on("scale", ({ target, transform, scale }) => {
+      layoutElementParams[selectedId.value[0]].scaleX = scale[0] / mscale;
+      layoutElementParams[selectedId.value[0]].scaleY = scale[1] / mscale;
+      updateTransform(
+        selected.value[0],
+        layoutElementParams[selectedId.value[0]]
+      );
+      updateProps();
+      update.value = false;
+    })
+    .on("scaleEnd", () => {
+      changeUpdate();
+      updateUpdates();
+      wsUpdate();
+      update.value = true;
+    });
+
+  /* rotatable */
+  moveable
+    .on("rotateStart", () => {
+      updateProps();
+      update.value = false;
+    })
+    .on("rotate", ({ target, rotation, transform }) => {
+      layoutElementParams[selectedId.value[0]].rotation = rotation;
+      updateTransform(
+        selected.value[0],
+        layoutElementParams[selectedId.value[0]]
+      );
+      updateProps();
+    })
+    .on("rotateEnd", () => {
+      changeUpdate();
+      updateUpdates();
+      wsUpdate();
+      update.value = true;
+    })
+    .on("rotateGroupStart", ({ events }) => {
+      events.forEach((ev, i) => {
+        ev.set(layoutElementParams[selectedId.value[i]].rotation);
+        ev.dragStart &&
+          ev.dragStart.set([
+            layoutElementParams[selectedId.value[i]].x,
+            layoutElementParams[selectedId.value[i]].y,
+          ]);
+      });
+      update.value = false;
+    })
+    .on("rotateGroup", ({ events }) => {
+      events.forEach((ev, i) => {
+        layoutElementParams[selectedId.value[i]].x = ev.drag.translate[0];
+        layoutElementParams[selectedId.value[i]].y = ev.drag.translate[1];
+        layoutElementParams[selectedId.value[i]].rotation = ev.rotation;
+
+        updateTransform(
+          selected.value[i],
+          layoutElementParams[selectedId.value[i]]
+        );
+      });
+    })
+    .on("rotateGroupEnd", () => {
+      updateUpdates();
+      wsUpdate();
+    });
+
+  /* warpable */
+  let matrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  moveable.on(
+    "warp",
+    ({ target, clientX, clientY, delta, dist, multiply, transform }) => {
+      // target.style.transform = transform;
+      matrix = multiply(matrix, delta);
+      target.style.transform = `matrix3d(${matrix.join(",")})`;
+    }
+  );
+
+  moveable.on("round", (e) => {
+    layoutElementParams[selectedId.value[0]].borderRadius = e.borderRadius;
+    updateTransform(
+      selected.value[0],
+      layoutElementParams[selectedId.value[0]]
+    );
+    updateUpdates();
+    wsUpdate();
+  });
+};
+
+let selecto: Selecto;
+const initSelecto = () => {
+  selecto = new Selecto({
+    container: document.getElementById("board"),
+    // dragContainer: document.getElementById("board"),
+    boundContainer: document.getElementById("board"),
+    selectableTargets: [].slice.call(document.getElementsByName("elements")),
+    selectByClick: true,
+    selectFromInside: false,
+    checkInput: true,
+    continueSelect: false,
+    toggleContinueSelect: "shift",
+    keyContainer: window,
+    hitRate: 0,
+  });
+
+  selecto
+    .on("dragStart", (e) => {
+      const target = e.inputEvent.target;
+      if (
+        moveable.isMoveableElement(target) ||
+        selected.value.some((t) => t === target || t.contains(target))
+      ) {
+        e.stop();
+      }
+    })
+    .on("selectEnd", (e) => {
+      e.removed.forEach((el) => {
+        layoutElements.value[el.getAttribute("data-index")].UnSelect();
+      });
+
+      selected.value = e.selected;
+      moveable.target = null;
+      moveable.target = e.selected;
+
+      selectedId.value.splice(0);
+      e.selected.forEach((el) => {
+        selectedId.value.push(parseInt(el.getAttribute("data-index")));
+        //selected.value.push(layoutElements.value[el.getAttribute("data-index")]);
+        layoutElements.value[el.getAttribute("data-index")].Select();
+      });
+
+      if (e.isDragStart) {
+        e.inputEvent.preventDefault();
+
+        setTimeout(() => {
+          moveable.dragStart(e.inputEvent);
+        });
+      }
+      updateProps();
+      changeUpdate();
+      update.value = false;
+    });
+};
+
+let comServer: ComServer[] = [];
+const changeUpdate = () => {
+  update.value = true;
+  emits("changeUpdate");
+};
+
+const updateUpdates = () => {
+  for (var i = 0; i < selected.value.length; ++i) {
+    var modifyed = layoutElementParams[selectedId.value[i]];
+    if (modifyed.id == 0) {
+      return;
+    }
+    var updateIndex = updates.findIndex((cv, ci) => {
+      if (cv.id == modifyed.id) {
+        return true;
+      }
+    });
+    if (updateIndex == -1) {
+      updates.push(modifyed);
+    } else {
+      updates[updateIndex] = modifyed;
+    }
+  }
+};
+
+const updateServer = () => {
+  // comServer.splice(0);
+  // for (var i = 0; i < updates.length; ++i) {
+  //   let newCom: ComServer = { id: 0, content: "" };
+  //   newCom.id = updates[i].id;
+  //   newCom.content = JSON.stringify(updates[i]);
+  //   console.log(newCom.id);
+  //   comServer.push(newCom);
+  // }
+  // console.log(comServer);
+  download(false);
+  // axios
+  //   .put(`/layout/${layoutId}/element`, comServer, { headers: headers })
+  //   .then((res) => {
+  //     console.log(res.data);
+  //     download(false);
+  //   });
+
+  // .then((res) => {
+  //   console.log(res.data);
+  //   if (res.data.msg == "成功") {
+  //     version = res.data.data.version;
+  //     var i = 0;
+  //     for (i = 0; i < res.data.data.elements.length; ++i) {
+  //       updateParams(res.data.data.elements[i]);
+  //       update.value = true;
+  //     }
+  //     for (; i < layoutElementParams.length; ++i) {
+  //       if (layoutElementParams[i].id != 0) {
+  //         layoutElementParams.splice(i, 1);
+  //       }
+  //     }
+  //   }
+  // });
+  //updates = [];
+};
+
+const initFromServer = () => {
+  layoutElementParams.splice(0);
+  axios
+    .get(`/layout/${layoutId}/elements`, { headers: headers })
+    .then((res) => {
+      if (res.data.msg == "成功") {
+        var i = 0;
+        for (i = 0; i < res.data.data.length; ++i) {
+          var el = JSON.parse(res.data.data[i].content);
+          el.id = res.data.data[i].id;
+          updateParams(el);
+          update.value = true;
+        }
+        setTimeout(() => {
+          for (var i = 0; i < layoutElementParams.length; ++i) {
+            updateTransform(
+              document.getElementsByName("elements")[i],
+              layoutElementParams[i]
+            );
+          }
+          selecto.selectableTargets = [].slice.call(
+            document.getElementsByName("elements")
+          );
+          moveable.elementGuidelines = [].slice.call(
+            document.getElementsByName("elements")
+          );
+          moveable.elementGuidelines.push(document.getElementById("canvas"));
+        });
+        // for (; i < layoutElementParams.length; ++i) {
+        //   if (layoutElementParams[i].id != 0) {
+        //     layoutElementParams.splice(i, 1);
+        //   }
+        // }
+      }
+    });
+};
+
+let createId: number = 0;
+let creator: boolean = false;
+const initWS = () => {
+  ws.onopen = () => {
+    ws.send("hi");
+  };
+  ws.onmessage = (res) => {
+    try {
+      console.log(res.data);
+      var data = JSON.parse(res.data as unknown as string);
+      switch (data.code) {
+        case 0: {
+          for (var i = 0; i < data.elements.length; ++i) {
+            wsResCreate(data.elements[i]);
+          }
+          setTimeout(() => {
+            for (var i = 0; i < layoutElementParams.length; ++i) {
+              updateTransform(
+                document.getElementsByName("elements")[i],
+                layoutElementParams[i]
+              );
+            }
+            selecto.selectableTargets = [].slice.call(
+              document.getElementsByName("elements")
+            );
+            moveable.elementGuidelines = [].slice.call(
+              document.getElementsByName("elements")
+            );
+            moveable.elementGuidelines.push(document.getElementById("canvas"));
+            if (creator) {
+              selecto.clickTarget(
+                produceClickE,
+                document.getElementsByName("elements")[createId]
+              );
+              layoutElements.value[createId].selectContent();
+              creator = false;
+              createId = 0;
+            }
+          });
+          var index = layoutElementParams.length - 1;
+          break;
+        }
+        case 1: {
+          for (var i = 0; i < data.elements.length; ++i) {
+            wsResMod(data.elements[i]);
+          }
+          break;
+        }
+        case 2: {
+          wsResDestroy(data.elements);
+          break;
+        }
+        case 3: {
+          createId = data.elements[0].id;
+        }
+      }
+    } catch (error) {
+      console.log(res);
+    }
+  };
+  ws.onerror = () => {
+    message.error("网络故障");
+  };
+  ws.onclose = () => {
+    //message.warning("连接已断开");
+  };
+};
+
+const wsResCreate = (data: ComServer) => {
+  var res = JSON.parse(data.content);
+  if (data.id != 0) {
+    //if (!(res.type == "text" && res.text == "")) {
+    res.id = data.id;
+    layoutElementParams.push(res);
+    paramsDic[data.id] = res;
+    //}
+  }
+  if (data.id == createId) {
+    creator = true;
+    createId = layoutElementParams.length - 1;
+  }
+  setTimeout(() => {
+    console.log(res);
+  });
+};
+
+const wsResMod = (data: ComServer) => {
+  var res = JSON.parse(data.content);
+  console.log(res);
+  if (paramsDic[res.id] != null) {
+    if (!(res.type == "text" && res.text == "")) {
+      for (var i = 0; i < layoutElementParams.length; ++i) {
+        if (layoutElementParams[i].id == res.id) {
+          layoutElementParams[i] = res;
+          updateTransform(
+            document.getElementsByName("elements")[i],
+            layoutElementParams[i]
+          );
+          moveable.target = null;
+          setTimeout(() => {
+            moveable.target = selected.value;
+          });
+        }
+      }
+    }
+  }
+};
+
+const wsResDestroy = (res) => {
+  console.log(layoutElementParams);
+  for (var i = layoutElementParams.length - 1; i >= 0; --i) {
+    for (var j = res.length - 1; j >= 0; --j) {
+      if (layoutElementParams[i].id == res[j].id) {
+        layoutElementParams.splice(i, 1);
+        res.splice(j, 1);
+        break;
+      }
+    }
+    if (res.length == 0) {
+      break;
+    }
+  }
+  setTimeout(() => {
+    for (; i < layoutElementParams.length; ++i) {
+      updateTransform(
+        document.getElementsByName("elements")[i],
+        layoutElementParams[i]
+      );
+    }
+  });
+  console.log(layoutElementParams);
+};
+
+const wsUpdate = () => {
+  if (ws.readyState != 1) {
+    return;
+  }
+  var form = {
+    code: 1,
+    elements: [],
+  };
+  for (var i = 0; i < updates.length; ++i) {
+    let newCom: ComServer = { id: 0, content: "" };
+    newCom.id = updates[i].id;
+    newCom.content = JSON.stringify(updates[i]);
+    console.log(newCom.id);
+    form.elements.push(newCom);
+  }
+  console.log(form);
+  ws.send(JSON.stringify(form));
+  updates = [];
+};
+
+const wsDestroy = () => {
+  if (ws.readyState != 1) {
+    return;
+  }
+  var form = {
+    code: 2,
+    elements: [],
+  };
+  for (var i = 0; i < selectedId.value.length; ++i) {
+    let newCom: ComServer = { id: 0, content: "" };
+    newCom.id = layoutElementParams[selectedId.value[i]].id;
+    newCom.content = JSON.stringify(
+      layoutElementParams[selectedId.value[i]].id
+    );
+    form.elements.push(newCom);
+  }
+  ws.send(JSON.stringify(form));
+  selected.value.splice(0);
+  selectedId.value.splice(0);
+  moveable.target = null;
+  updateProps();
+};
+
+const wsCreate = (data: elementParams) => {
+  if (ws.readyState != 1) {
+    return;
+  }
+  var form = {
+    code: 0,
+    elements: [],
+  };
+  //datas.forEach((data) => {
+  let newCom: ComServer = { id: 0, content: "" };
+  newCom.id = data.id;
+  newCom.content = JSON.stringify(data);
+  form.elements.push(newCom);
+  //});
+
+  console.log(form);
+  ws.send(JSON.stringify(form));
+
+  selected.value.splice(0);
+  selectedId.value.splice(0);
+  moveable.target = null;
+  updateProps();
+};
+
+const wsClose = () => {
+  if (ws != null)
+    if (ws.readyState != 1) {
+      return;
+    }
+  ws.close();
+};
+
+const updateSelects = (data: elementParams) => {
+  if (data.text == "" || data.text == null) {
+    wsDestroy();
+  } else {
+    layoutElementParams[selectedId.value[0]].text = data.text;
+  }
+  updateUpdates();
+  wsUpdate();
+  console.log(layoutElementParams[selectedId.value[0]]);
+};
+
+const editContent = (index: number) => {
+  var target = layoutElements.value[index];
+  target.selectContent();
+  update.value = false;
+  moveable.target = null;
+  selecto.selectableTargets = null;
+  setTimeout(() => {
+    selecto.selectableTargets = [].slice.call(
+      document.getElementsByName("elements")
+    );
+  });
+};
+
+const updateTransform = (element: HTMLElement, data: elementParams) => {
+  element!.style.width = data.width * mscale + "px";
+  if (data.height < 0) {
+    element!.style.height = "auto";
+  } else {
+    element!.style.height = data.height * mscale + "px";
+  }
+  element!.style.borderRadius = data.borderRadius;
+
+  //console.log(data);
+
+  if (data.type != "text") {
+    element!.style.transform =
+      `translate(${data.x * mscale}px,${data.y * mscale}px)` +
+      ` scale(${data.scaleX},${data.scaleY})` +
+      ` rotate(${data.rotation}deg)`;
+  } else {
+    element!.style.transform =
+      `translate(${data.x * mscale}px,${data.y * mscale}px)` +
+      ` scale(${data.scaleX * mscale},${data.scaleY * mscale})` +
+      ` rotate(${data.rotation}deg)`;
+  }
+};
+
+const updateParams = (data: elementParams) => {
+  if (data.id != 0) {
+    if (!(data.type == "text" && data.text == "")) {
+      layoutElementParams.push(data);
+    }
+  }
+  console.log(layoutElementParams);
+  // if (paramsDic[data.id] == null) {
+  //   layoutElementParams.push(data);
+  //   paramsDic[data.id] = data;
+  //   return;
+  // }
+
+  // paramsDic[data.id]!.id = data.id;
+  // paramsDic[data.id]!.x = data.x;
+  // paramsDic[data.id]!.y = data.y;
+  // paramsDic[data.id]!.width = data.width;
+  // paramsDic[data.id]!.height = data.height;
+  // paramsDic[data.id]!.rotation = data.rotation;
+  // paramsDic[data.id]!.borderWidth = data.borderWidth;
+  // paramsDic[data.id]!.borderRadius = data.borderRadius;
+  // paramsDic[data.id]!.type = data.type;
+  // paramsDic[data.id]!.color = data.color;
+  // paramsDic[data.id]!.borderColor = data.borderColor;
+  // paramsDic[data.id]!.src = data.src;
+  // paramsDic[data.id]!.text = data.text;
+  // paramsDic[data.id]!.fontSize = data.fontSize;
+  // update.value = false;
+  // // setTimeout(() => {
+  // //   update.value = true;
+  // // }, 100);
+  // updateProps();
+};
+
+const updateProps = () => {
+  if (selected.value.length > 1) {
+    emits("updateProps", null);
+    return;
+  }
+  if (selected.value.length == 0 || selectedId.value[0] < 0) {
+    emits("updateProps", null);
+    return;
+  }
+  emits("updateProps", layoutElementParams[selectedId.value[0]]);
+};
+
+const cancelSelect = () => {
+  if (!selectEns) {
+    for (var i = 0; i < selected.value.length; ++i) {
+      if (selected.value[i] != null) {
+        selected.value[i].UnSelect();
+      }
+    }
+    selected.value.splice(0);
+    selectedId.value.splice(0);
+    updateProps();
+  }
+};
+
+const destroy = () => {
+  selectedId.value.forEach((el) => {
+    console.log(layoutId);
+    console.log(layoutElementParams[el].id);
+    axios
+      .delete(`/layout/${layoutId}/element/${layoutElementParams[el].id}`, {
+        headers: headers,
+      })
+      .then((res) => {
+        console.log(res.data);
+      });
+  });
+  selectedId.value.sort();
+  for (var i = selectedId.value.length - 1; i >= 0; --i) {
+    layoutElementParams.splice(selectedId.value[i], 1);
+  }
+  selected.value.splice(0);
+  selectedId.value.splice(0);
+  moveable.target = null;
+  updateProps();
+};
+
+const PrepareElement = (elementType: string) => {
+  preparedType = elementType;
+};
+
+let produceClickE: MouseEvent = null;
+const ProduceElement = (e: MouseEvent) => {
+  produceClickE = e;
+  if (dragging) {
+    dragging = false;
+  }
+  var src = "";
+  var backColor = "#D42B39";
+  if (preparedType != "rect" && preparedType != "text" && preparedType != "") {
+    src = preparedType;
+    preparedType = "rect";
+    backColor = "transparent";
+  }
+  var iheight = 200 * mscale;
+  if (preparedType == "text") {
+    iheight = -1;
+  }
+  if (preparedType != "") {
+    update.value = true;
+    wsCreate({
+      id: 0,
+      x: e.clientX - canvasTrans.x,
+      y: e.clientY - canvasTrans.y,
+      width: 200 * mscale,
+      height: iheight,
+      scaleX: 1,
+      scaleY: 1,
+      rotation: 0,
+      borderWidth: 0,
+      borderRadius: "0px",
+      type: preparedType,
+      color: backColor,
+      borderColor: "transparent",
+      src: src,
+      text: "",
+      fontSize: 20 * mscale,
+      //update: true,
+    });
+    preparedType = "";
+  }
+  //   var index = layoutElementParams.length - 1;
+
+  //   setTimeout(() => {
+  //     //let el: HTMLElement[] = [];
+  //     //el.push(
+
+  //     //);
+  //     selecto.selectableTargets = [].slice.call(
+  //       document.getElementsByName("elements")
+  //     );
+  //     var el = document.getElementsByName("elements")[index];
+  //     switch (layoutElementParams[index].type) {
+  //       case "text": {
+  //         layoutElementParams[index].height = -1;
+  //       }
+  //     }
+  //     updateTransform(el, layoutElementParams[index]);
+  //     selecto.clickTarget(e, el);
+  //     moveable.elementGuidelines = [].slice.call(
+  //       document.getElementsByName("elements")
+  //     );
+  //     moveable.elementGuidelines.push(document.getElementById("canvas"));
+  //   });
+  //   axios
+  //     .post(
+  //       `/layout/${layoutId}/element`,
+  //       { content: JSON.stringify(layoutElementParams[index]) },
+  //       { headers: headers }
+  //     )
+  //     .then((res) => {
+  //       console.log(res.data);
+  //       if (res.data.msg == "成功") {
+  //         layoutElementParams[index].id = res.data.data.id;
+  //       }
+  //     });
+  // }
+  //updateServer(layoutElementParams.length-1);
+};
+
+// let canvas2: any;
+let imgUri: string;
+
+const download = (isDownload: boolean, type?: string, name?:string) => {
+  if (document.getElementById("canvas") == null) {
+    return;
+  }
+  html2canvas(document.getElementById("canvas")!, { useCORS: true }).then(
+    function (canvas) {
+      canvas.toBlob((blob) => {
+        if (isDownload) {
+          saveAs(blob, name + "." + type);
+        }
+        var form = new FormData();
+        form.append(
+          "file",
+          new File([blob], "test.png", { type: "image/png" })
+        );
+        var imgUri: string;
+        axios({
+          url: "/resource/img",
+          method: "post",
+          headers: headers,
+          data: form,
+        }).then((res) => {
+          console.log(res.data);
+          if (res.data.msg == "成功") {
+            imgUri = res.data.data;
+            axios
+              .put(
+                `/layout/${layoutId}/img`,
+                {
+                  src: imgUri,
+                  width: props.canvasWidth,
+                  height: props.canvasHeight,
+                },
+                { headers: headers }
+              )
+              .then((res) => {
+                console.log(res.data);
+              });
+            emits("initPageImgs");
+          }
+        });
+      });
+    }
+  );
+};
+
+// type Model = {
+//   name: string;
+//   elements: elementParams[];
+//   srcs: string[];
+//   cover: string;
+// };
+
+// let model: Model = {
+//   name: "文档管理",
+//   elements: [],
+//   srcs: [],
+//   cover: "",
+// };
+// let imgs: string[] = [];
+
+// const importImages = () => {
+//   var imgInputer = document.getElementById("ModelLoader");
+//   var coverInputer = document.getElementById("CoverLoader");
+//   imgInputer!.onchange = () => {
+//     var counter = imgInputer.files.length;
+//     for (var i = 0; i < imgInputer.files.length; ++i) {
+//       var form = new FormData();
+//       form.append("file", imgInputer.files[i]);
+//       axios({
+//         url: "/resource/img",
+//         method: "post",
+//         headers: headers,
+//         data: form,
+//       }).then((res) => {
+//         console.log(res.data);
+//         if (res.data.msg == "成功") {
+//           imgs.push(res.data.data);
+//         }
+//         console.log(imgs);
+//         counter--;
+//         if (counter == 0) {
+//           model.srcs = imgs;
+//           axios
+//             .post(
+//               "/layout/module",
+//               {
+//                 name: model.name,
+//                 content: JSON.stringify(model),
+//               },
+//               { headers: headers }
+//             )
+//             .then((res) => {
+//               console.log(res.data);
+//             });
+//         }
+//       });
+//     }
+//   };
+//   coverInputer!.onchange = () => {
+//     var form = new FormData();
+//     form.append("file", coverInputer.files[0]);
+//     axios({
+//       url: "/resource/img",
+//       method: "post",
+//       headers: headers,
+//       data: form,
+//     }).then((res) => {
+//       console.log(res.data);
+//       if (res.data.msg == "成功") {
+//         model.cover = res.data.data;
+//         axios
+//           .post(
+//             "/layout/module",
+//             {
+//               name: model.name,
+//               content: JSON.stringify(model),
+//             },
+//             { headers: headers }
+//           )
+//           .then((res) => {
+//             console.log(res.data);
+//           });
+//       }
+//     });
+//   };
+// };
+
+// const saveModel = () => {
+//   model.elements = layoutElementParams;
+//   axios
+//     .post(
+//       "/layout/module",
+//       {
+//         name: model.name,
+//         content: JSON.stringify(model),
+//       },
+//       { headers: headers }
+//     )
+//     .then((res) => {
+//       console.log(res.data);
+//     });
+// };
+
+defineExpose({
+  PrepareElement,
+  download,
+  updateServer,
+  wsClose,
+});
+
+const startDrag = (e: MouseEvent) => {
+  if (spacing) {
+    dragFromX = e.clientX;
+    dragFromY = e.clientY;
+
+    transDragFromX = canvasTrans.x;
+    transDragFromY = canvasTrans.y;
+
+    dragging = true;
+  }
+};
+
+const dragCanvas = (e: MouseEvent) => {
+  if (dragging) {
+    canvasTrans.x = transDragFromX + e.clientX - dragFromX;
+    canvasTrans.y = transDragFromY + e.clientY - dragFromY;
+
+    document.getElementById("canvas")!.style.left = `${canvasTrans.x}px`;
+    document.getElementById("canvas")!.style.top = `${canvasTrans.y - 36}px`;
+  }
+};
+
+onMounted(() => {
+  initMoveable();
+  initSelecto();
+  initScale();
+  //updateServer();
+
+  document.onkeyup = (e) => {
+    if (e.key == "Delete") {
+      wsDestroy();
+    }
+    if (e.key == " ") {
+      selecto.dragCondition = () => {
+        return true;
+      };
+      moveable.draggable = true;
+      spacing = false;
+      dragging = false;
+      locked = false;
+    }
+  };
+  document.onkeydown = (e) => {
+    if (e.key == " ") {
+      selecto.dragCondition = () => {
+        return false;
+      };
+      moveable.draggable = false;
+      spacing = true;
+      locked = true;
+    }
+  };
+  // canvasTrans.width = document.getElementById("canvas")!.clientWidth;
+  // canvasTrans.height = document.getElementById("canvas")!.clientHeight;
+  // canvasTrans.x = document.body.clientWidth / 2 - canvasTrans.width / 2;
+  // canvasTrans.y = 148;
+  // document.getElementById("canvas")!.style.left = `${canvasTrans.x}px`;
+  // document.getElementById("canvas")!.style.top = `${canvasTrans.y - 36}px`;
+  wheelScale();
+});
+
+const initScale = () => {
+  if (document.getElementById("canvas") == null) {
+    return;
+  }
+  document.getElementById("canvas")!.style.width =
+    props.canvasWidth / 2.4 + "px";
+  document.getElementById("canvas")!.style.height =
+    props.canvasHeight / 2.4 + "px";
+  canvasTrans.width = document.getElementById("canvas")!.clientWidth;
+  canvasTrans.height = document.getElementById("canvas")!.clientHeight;
+  canvasTrans.x = document.body.clientWidth / 2 - canvasTrans.width / 2;
+  canvasTrans.y = 148;
+  document.getElementById("canvas")!.style.left = `${canvasTrans.x}px`;
+  document.getElementById("canvas")!.style.top = `${canvasTrans.y - 36}px`;
+};
+
+let mscale = 1;
+const maxScale = 5;
+const minScale = 0.5;
+const wheelScale = () => {
+  document.getElementById("board")!.onwheel = (e) => {
+    let scope: number;
+    if (e.deltaY > 0) {
+      scope = 1 / 1.25;
+    } else {
+      scope = 1.25;
+    }
+
+    if (mscale * scope > maxScale || mscale * scope < minScale) {
+      return;
+    }
+    mscale *= scope;
+    update.value = true;
+
+    for (var i = 0; i < layoutElementParams.length; ++i) {
+      if (layoutElementParams[i] == null) {
+        continue;
+      }
+      // layoutElementParams[i]!.update = true;
+      // layoutElementParams[i]!.x *= scope;
+      // (layoutElementParams[i]!.x - e.clientX + canvasTrans.x) * scope +
+      // e.clientX -
+      // canvasTrans.x;
+      // layoutElementParams[i]!.y *= scope;
+      // (layoutElementParams[i]!.y - e.clientY + canvasTrans.y) * scope +
+      // e.clientY -
+      // canvasTrans.y;
+      // layoutElementParams[i]!.width *= scope;
+      // layoutElementParams[i]!.height *= scope;
+      //layoutElementParams[i]!.fontSize *= scope;
+      if (layoutElementParams[i].type == "text") {
+      }
+      updateTransform(
+        document.getElementsByName("elements")[i],
+        layoutElementParams[i]
+      );
+    }
+    canvasTrans.x = (canvasTrans.x - e.clientX) * scope + e.clientX;
+    canvasTrans.y = (canvasTrans.y - e.clientY) * scope + e.clientY;
+    canvasTrans.width *= scope;
+    canvasTrans.height *= scope;
+    document.getElementById("canvas")!.style.left = `${canvasTrans.x}px`;
+    document.getElementById("canvas")!.style.top = `${canvasTrans.y - 48}px`;
+    document.getElementById("canvas")!.style.width = `${canvasTrans.width}px`;
+    document.getElementById("canvas")!.style.height = `${canvasTrans.height}px`;
+    moveable.target = null;
+    setTimeout(() => {
+      moveable.target = selected.value;
+    });
+
+    updateProps();
+  };
+};
+
+watch(
+  () => props,
+  (newVal) => {
+    if (update.value == false) {
+      //changeUpdate();
+      return;
+    }
+    if (selected.value.length > 1) {
+      return;
+    }
+    if (selectedId.value.length <= 0 || selectedId.value[0] < 0) {
+      return;
+    }
+    update.value = true;
+    if (
+      newVal.elementProps.borderWidth > 0 &&
+      layoutElementParams[selectedId.value[0]]!.borderWidth !=
+        newVal.elementProps.borderWidth &&
+      newVal.elementProps.borderColor == "transparent"
+    ) {
+      message.info("注意：边框颜色为透明");
+    }
+    layoutElementParams[selectedId.value[0]]!.id = newVal.elementProps.id;
+    layoutElementParams[selectedId.value[0]]!.x = newVal.elementProps.x;
+    layoutElementParams[selectedId.value[0]]!.y = newVal.elementProps.y;
+    layoutElementParams[selectedId.value[0]]!.width = newVal.elementProps.width;
+    layoutElementParams[selectedId.value[0]]!.height =
+      newVal.elementProps.height;
+    layoutElementParams[selectedId.value[0]]!.scaleX =
+      newVal.elementProps.scaleX;
+    layoutElementParams[selectedId.value[0]]!.scaleY =
+      newVal.elementProps.scaleY;
+    layoutElementParams[selectedId.value[0]]!.rotation =
+      newVal.elementProps.rotation;
+    layoutElementParams[selectedId.value[0]]!.borderWidth =
+      newVal.elementProps.borderWidth;
+    layoutElementParams[selectedId.value[0]]!.borderRadius =
+      newVal.elementProps.borderRadius;
+    layoutElementParams[selectedId.value[0]]!.color = newVal.elementProps.color;
+    layoutElementParams[selectedId.value[0]]!.borderColor =
+      newVal.elementProps.borderColor;
+    layoutElementParams[selectedId.value[0]]!.type = newVal.elementProps.type;
+    layoutElementParams[selectedId.value[0]]!.src = newVal.elementProps.src;
+    layoutElementParams[selectedId.value[0]]!.text = newVal.elementProps.text;
+    layoutElementParams[selectedId.value[0]]!.fontSize =
+      newVal.elementProps.fontSize;
+    updateTransform(
+      selected.value[0],
+      layoutElementParams[selectedId.value[0]]
+    );
+    moveable.target = null;
+    setTimeout(() => {
+      if (update.value) moveable.target = selected.value;
+    });
+    updateUpdates();
+    wsUpdate();
+  },
+  {
+    deep: true,
+    immediate: true,
+  }
+);
+
+watch(
+  () => props.modelElements,
+  (newVal) => {
+    console.log(newVal);
+    if (newVal.length == 0) {
+      return;
+    }
+    for (var i = 0; i < newVal.length; ++i) {
+      wsCreate(newVal[i]);
+    }
+  },
+  {
+    deep: true,
+    //immediate:true,
+  }
+);
+
+watch(
+  () => props.canvasWidth,
+  (newVal) => {
+    initScale();
+    download(false);
+  }
+);
+
+watch(
+  () => props.layoutId,
+  (newVal) => {
+    layoutId = props.layoutId;
+    layoutElementParams.splice(0);
+    ws = new WebSocket(
+      "ws://82.156.125.202/soft2/socket/websocket/layout/" +
+        layoutId +
+        "?Authorization=" +
+        [utils.getCookie("Authorization")]
+    );
+    initWS();
+    //initFromServer();
+  }
+);
+
+watch(
+  () => props.tool,
+  (newVal) => {
+    switch (newVal) {
+      case "pointer": {
+        moveable.draggable = true;
+        moveable.resizable = true;
+        moveable.scalable = false;
+        moveable.rotatable = true;
+        moveable.warpable = false;
+        moveable.clippable = false;
+        moveable.roundable = false;
+        moveable.origin = true;
+        moveable.originDraggable = true;
+        break;
+      }
+      case "drag": {
+        moveable.draggable = true;
+        moveable.resizable = false;
+        moveable.scalable = false;
+        moveable.rotatable = false;
+        moveable.warpable = false;
+        moveable.clippable = false;
+        moveable.roundable = false;
+        moveable.origin = false;
+        moveable.originDraggable = false;
+        break;
+      }
+      case "resize": {
+        moveable.draggable = true;
+        moveable.resizable = true;
+        moveable.scalable = false;
+        moveable.rotatable = false;
+        moveable.warpable = false;
+        moveable.clippable = false;
+        moveable.roundable = false;
+        moveable.origin = false;
+        moveable.originDraggable = false;
+        break;
+      }
+      case "scale": {
+        moveable.draggable = true;
+        moveable.resizable = false;
+        moveable.scalable = true;
+        moveable.rotatable = false;
+        moveable.warpable = false;
+        moveable.clippable = false;
+        moveable.roundable = false;
+        moveable.origin = false;
+        moveable.originDraggable = false;
+        break;
+      }
+      case "rotate": {
+        moveable.draggable = true;
+        moveable.resizable = false;
+        moveable.scalable = false;
+        moveable.rotatable = true;
+        moveable.warpable = false;
+        moveable.clippable = false;
+        moveable.roundable = false;
+        moveable.origin = true;
+        moveable.originDraggable = true;
+        break;
+      }
+      case "wrap": {
+        moveable.draggable = false;
+        moveable.resizable = false;
+        moveable.scalable = false;
+        moveable.rotatable = false;
+        moveable.warpable = true;
+        moveable.clippable = false;
+        moveable.roundable = false;
+        moveable.origin = false;
+        moveable.originDraggable = false;
+      }
+      case "clip": {
+        moveable.draggable = false;
+        moveable.resizable = false;
+        moveable.scalable = false;
+        moveable.rotatable = false;
+        moveable.warpable = false;
+        moveable.clippable = true;
+        moveable.roundable = false;
+        moveable.origin = false;
+        moveable.originDraggable = false;
+      }
+      case "round": {
+        moveable.draggable = true;
+        moveable.resizable = false;
+        moveable.scalable = false;
+        moveable.rotatable = false;
+        moveable.warpable = false;
+        moveable.clippable = false;
+        moveable.roundable = true;
+        moveable.origin = false;
+        moveable.originDraggable = false;
+      }
+    }
+  }
+);
+</script>
+
+<style scoped>
+.innerboard {
+  width: 100%;
+  background-color: #000000;
+}
+.innercanvas {
+  width: 676px;
+  height: 335px;
+  background-color: #fff;
+  position: absolute;
+  left: 50%;
+  top: 100px;
+}
+.blank {
+  position: absolute;
+  top: 100vw;
+}
+</style>
