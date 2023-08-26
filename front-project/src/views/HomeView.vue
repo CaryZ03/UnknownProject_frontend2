@@ -86,10 +86,6 @@
   </div>
 </template>
 
-<script>
-// @ is an alias to /src
-// import HelloWorld from '@/components/HelloWorld.vue'
-</script>
 
 
 <script>
@@ -102,7 +98,6 @@ export default {
   watch: {},
   computed: {},
   methods: {},
-  created() {},
   mounted() {
     const wrapper = document.querySelector(".wrapper");
     const loginLink = document.querySelector(".login-link");
